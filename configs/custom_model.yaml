@@ -1,0 +1,47 @@
+# 自定义 nn.Module + GradCAM 示例
+# 通过 entrypoint 引用 custom_models/my_simple_cnn.py 中的 build_net 工厂。
+# 要点：
+#   - source: custom
+#   - entrypoint:  "包.模块:函数"，函数返回 nn.Module
+#   - entrypoint_kwargs: 透传给该函数
+#   - target_layer: 指向你模型里最后一个 4D 卷积特征图（这里是 features 中第 3 个 conv block 末尾的 ReLU）
+#
+# 运行须在 CAM/ 目录下：
+#   D:\miniconda\envs\py310\python.exe cam_runner.py --config configs/custom_model.yaml
+
+device: cuda
+
+model:
+  source: custom
+  entrypoint: custom_models.my_simple_cnn:build_net
+  entrypoint_kwargs:
+    num_classes: 10
+    width: 32
+  weights_path: null          # 现实中：填入你训练好的 SimpleCNN 权重
+  weights_strict: true
+  # SimpleCNN.features 索引：
+  #   [0..2]  conv_block(3, 32)
+  #   [3]     MaxPool
+  #   [4..6]  conv_block(32, 64)
+  #   [7]     MaxPool
+  #   [8..10] conv_block(64, 128)   <- 推荐 target_layer = features.10 (ReLU 输出)
+  #   [11]    MaxPool
+  target_layer: "features.10"
+  reshape_transform: null
+
+input:
+  image: D:/codes/data/Gastrovision/Colon diverticula/3.jpg
+  image_size: 224
+  # 自训练模型 mean/std 通常按你训练集统计；这里沿用 ImageNet 仅为演示
+  mean: [0.485, 0.456, 0.406]
+  std:  [0.229, 0.224, 0.225]
+
+cam:
+  method: gradcam
+  target_class: null
+  aug_smooth: false
+  eigen_smooth: false
+  extra: {}
+
+output:
+  path: outputs/custom_model_gradcam.png

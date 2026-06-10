@@ -1,0 +1,44 @@
+# pku1_convnext_base：自训练 ConvNeXt-Base + MLP head 的统一 runner 配置
+# 通过 entrypoint 复用 adapt_pku1_convnext.py 中的 build_pku1_convnext 工厂，
+# 这样 cam_runner.py 与独立脚本共用同一份模型构建逻辑（单一事实源）。
+#
+# 运行（须在 CAM/ 目录下）：
+#   D:\miniconda\envs\py310\python.exe cam_runner.py --config configs/pku1_convnext.yaml
+#   D:\miniconda\envs\py310\python.exe cam_runner.py --config configs/pku1_convnext.yaml --method gradcam++
+#   D:\miniconda\envs\py310\python.exe cam_runner.py --config configs/pku1_convnext.yaml --image D:/path/to/x.jpg --target-class 7
+
+device: cuda
+
+model:
+  source: custom
+  # adapt_pku1_convnext.py 在仓库根目录，cam_runner.py 也从仓库根启动，故可直接 import
+  entrypoint: adapt_pku1_convnext:build_pku1_convnext
+  entrypoint_kwargs:
+    num_classes: 22       # test_results.json 中类索引为 0..21
+    embedding_dim: 512    # 与训练配置 embedding_dim 一致
+    dropout: 0.2          # 与训练配置 classifier_dropout 一致
+  weights_path: D:/codes/work-projects/CAM/pku1_convnext_base/best_model.pth
+  weights_strict: true    # 结构与权重完全匹配；若改 strict 则会静默吞结构错
+  # 选最后一个 CNBlock **内部** 的 depthwise Conv2d，等价于 model.features[-1][-1].block[0]
+  # 不要用整段 CNBlock 输出（features.7.2）：恒等残差会让 GradCAM/XGradCAM/HiResCAM
+  # 退化成同一公式，且 GradCAM++ 输出全零。详见 adapt_pku1_convnext.py 模块 docstring。
+  target_layer: "features.7.2.block.0"
+  reshape_transform: null  # ConvNeXt 是纯 CNN，不需要 reshape
+
+input:
+  # 任意一张内镜图；若没有可改成 imgs/both.png 之类的演示图
+  image: D:/codes/work-projects/CAM/imgs/both.png
+  image_size: 224          # 与训练 image_size 一致
+  # 训练时 pretrained=True（ImageNet 初始化），保持 ImageNet mean/std
+  mean: [0.485, 0.456, 0.406]
+  std:  [0.229, 0.224, 0.225]
+
+cam:
+  method: gradcam          # 备选见 core/cam_factory.py 的 _REGISTRY
+  target_class: null       # null = 用模型预测最大类
+  aug_smooth: false
+  eigen_smooth: false
+  extra: {}                # AblationCAM 时建议: { batch_size: 16 }
+
+output:
+  path: outputs/pku1_convnext_gradcam.png

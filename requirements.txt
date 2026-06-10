@@ -1,0 +1,9 @@
+torch>=2.0
+torchvision
+grad-cam>=1.5
+pillow
+numpy
+opencv-python
+pyyaml
+# 可选：使用 timm 模型时需要
+# timm

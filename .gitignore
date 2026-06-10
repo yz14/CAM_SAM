@@ -1,0 +1,8 @@
+outputs/
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+*.pth
+imgs
+pku1_convnext_base

@@ -1,0 +1,37 @@
+# ViT-B/16 (torchvision) + GradCAM
+# 说明：默认随机权重，仅演示 pipeline。把 weights_path 指向你自己的 vit_b_16 权重即可。
+# 教学要点：reshape_transform.kind=vit 会自动构造 "(B,1+H*W,C)->(B,C,H,W)" 变换。
+
+device: cuda
+
+model:
+  source: torchvision
+  name: vit_b_16
+  num_classes: 1000
+  pretrained: false           # 改 true + 有网络则下载 ImageNet 权重
+  weights_path: null          # 或 D:/path/to/your_vit_b16.pth
+  weights_strict: true
+  # 关键：ViT 的目标层 = 最后一个 EncoderBlock 的 ln_1
+  target_layer: "encoder.layers.-1.ln_1"
+  # 关键：ViT 必须配 reshape_transform
+  reshape_transform:
+    kind: vit
+    height: 14
+    width: 14
+    has_cls_token: true
+
+input:
+  image: D:/codes/data/Gastrovision/Colon diverticula/3.jpg
+  image_size: 224
+  mean: [0.485, 0.456, 0.406]
+  std:  [0.229, 0.224, 0.225]
+
+cam:
+  method: gradcam
+  target_class: null
+  aug_smooth: false
+  eigen_smooth: false
+  extra: {}
+
+output:
+  path: outputs/vit_gradcam.png
