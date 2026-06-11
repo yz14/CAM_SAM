@@ -93,47 +93,51 @@ def _sigmoid(x):
 
 
 def select_candidate(masks_logits, pred_boxes, scores, prompt_box_xyxy,
-                     min_iou: float = 0.0, min_score: float = 0.0,
-                     min_coverage: float = 0.0,
-                     min_mask_frac: float = 1e-4, masks_bin=None):
-    """从 SAM3 输出的候选实例中选最匹配提示框的一个。
+                     min_iou: float = 0.1, min_score: float = 0.0,
+                     min_coverage: float = 0.0, min_precision: float = 0.5,
+                     min_mask_frac: float = 5e-4, max_mask_frac: float = 0.6,
+                     masks_bin=None, debug: bool = False):
+    """从 SAM3 输出的候选实例中选一个，返回 (mask (H,W) uint8∈{0,1}, info)。
 
-    返回 (mask_prob (H,W) float ∈ [0,1], info dict)；无合格候选返回 (None, info)。
+    **以 v1（endoscope_sam3.py，确认能分出目标）为基准**：用模型自带的二值
+    ``output["masks"]``（logit>0，下同），在「框内」候选里取 ``argmax(score)``。
+    v1 只是 argmax(score)、假阳多；这里在它前面加一层**空间过滤**，把跑到框外、
+    覆盖整图、或空的候选先剔掉，只保留落在 CAM 框里的候选，再按 score 选——
+    既保留 v1 的找目标能力，又压掉框外/整图假阳。
 
-    **按「mask 与提示框的契合度」选，而不是按检测分 score。**
-    诊断发现：概念模式下 SAM3 会返回上百个候选，**检测分和 mask 质量并不挂钩**
-    —— 分最高的候选常常「框很准但 mask 是空的」（score 0.93 / box-IoU 0.93 但
-    maskArea≈0），真正的息肉 mask 反而在低分候选里（score~0.1 但 maskArea 0.12）。
-    旧的 score×IoU 选法必然选中那个空 mask 检测，导致整图分不出目标。
+    每个候选先算：
+      - area      = |mask| / 图像面积
+      - precision = |mask ∩ 提示框| / |mask|     —— mask 有多少落在框内
+      - coverage  = |mask ∩ 提示框| / |提示框|   —— mask 填满了多少 CAM 框
+    过滤条件（任一不满足即丢弃）：
+      - min_mask_frac ≤ area ≤ max_mask_frac     —— 丢空 mask、丢覆盖整图的背景块
+      - precision ≥ min_precision                —— 丢框外飞溅/整图（它们 precision 很低）
+      - coverage  ≥ min_coverage（默认 0）       —— 可选，进一步要求填满框
+      - IoU(候选框, 提示框) ≥ min_iou            —— 廉价空间初筛
+    幸存候选里取 argmax(score)（与 v1 一致），coverage 作同分裂项。
+    若没有候选通过 precision 门槛，则放宽到「非空 + IoU」再 argmax(score) 兜底，
+    保证「有框尽量出目标」，不至于像之前那样整图空白。
 
-    现在的排序键 = coverage × precision：
-      - coverage  = |mask ∩ 提示框| / |提示框|     —— 这个 mask 填满了多少提示框
-      - precision = |mask ∩ 提示框| / |mask|       —— mask 有多少落在框内（惩罚框外飞溅）
-    既选中「填满 CAM 框」的目标，又自动压掉跑到框外的假阳。空/退化 mask 由
-    min_mask_frac 直接丢弃。min_iou 用候选框与提示框做一道廉价空间初筛。
-
-    mask 概率 = sigmoid(masks_logits)：SAM3 的 ``masks_logits`` 是**原始 logit**，
-    旧版当成概率直接 >0.5 会把弱边界侵蚀掉（v1 用的是模型自带二值 ``masks``，即
-    logit>0）。这里统一转成概率，配 --mask-threshold（默认 0.5 = logit 0）二值化。
-    若 SAM3 输出里带二值 ``masks``，优先用它来做候选打分（与模型自身判定一致）。
-
-    min_score 是对「选中候选」检测分的下限（默认 0 不过滤）；注意目标实例的
-    score 可能很低（~0.1），**调高 min_score 有丢目标风险**，抑制假阳优先用
-    --min-iou / --min-coverage（见调参表）。
+    ⚠️ 关键：用 ``masks_bin``(=output["masks"]) 作权威 mask，**不要**用
+    ``masks_logits > 阈值``——诊断显示二者差异极大（masks_logits>0.5 常把真实
+    mask 侵蚀到近乎空），v1 用的就是 ``masks``。masks_bin 缺失时才退回 logit>0。
     """
     masks_logits = to_numpy(masks_logits)
     pred_boxes = to_numpy(pred_boxes)
     scores = to_numpy(scores)
     masks_bin = to_numpy(masks_bin)
-    info = dict(n_candidates=0, score=None, iou=None, coverage=None, precision=None)
-    if masks_logits is None or len(masks_logits) == 0:
+    info = dict(n_candidates=0, score=None, iou=None,
+                coverage=None, precision=None, area=None, picked=None)
+
+    # 权威 mask：优先模型自带二值 masks；否则退回 masks_logits>0（logit 阈值 0）
+    if masks_bin is not None and len(masks_bin) > 0:
+        M = squeeze_masks(masks_bin)
+    elif masks_logits is not None and len(masks_logits) > 0:
+        M = (squeeze_masks(masks_logits) > 0).astype(np.uint8)
+    else:
         return None, info
 
-    masks_logits = squeeze_masks(masks_logits)
-    probs = _sigmoid(masks_logits)
-    if masks_bin is not None:
-        masks_bin = squeeze_masks(masks_bin)
-    n, H, W = probs.shape
+    n, H, W = M.shape
     info["n_candidates"] = int(n)
 
     # 提示框像素范围（裁剪到图内）
@@ -141,48 +145,72 @@ def select_candidate(masks_logits, pred_boxes, scores, prompt_box_xyxy,
     ix0, iy0 = max(int(round(x0)), 0), max(int(round(y0)), 0)
     ix1, iy1 = min(int(round(x1)), W), min(int(round(y1)), H)
     box_area = max(ix1 - ix0, 0) * max(iy1 - iy0, 0)
+    img_area = float(H * W)
 
-    best, best_key = None, -1.0
+    rows = []   # (i, score, iou, area_frac, coverage, precision, passed)
+    survivors, fallback = [], []
     for i in range(n):
-        # 候选二值 mask：优先模型自带 masks（logit>0），否则 prob>0.5
-        if masks_bin is not None and len(masks_bin) > i:
-            bm = (masks_bin[i] > 0).astype(np.uint8)
-        else:
-            bm = (probs[i] > 0.5).astype(np.uint8)
+        bm = (M[i] > 0).astype(np.uint8)
         area = int(bm.sum())
-        if area < min_mask_frac * bm.size:   # 丢弃空/退化 mask（旧版被它坑了）
-            continue
+        area_frac = area / img_area
+        s = float(scores[i]) if scores is not None and len(scores) > i else 0.0
         iou = box_iou_xyxy(pred_boxes[i].tolist(), prompt_box_xyxy) \
             if pred_boxes is not None and len(pred_boxes) > i else 0.0
-        if iou < min_iou:
-            continue
-        inter = int(bm[iy0:iy1, ix0:ix1].sum()) if box_area > 0 else 0
+        inter = int(bm[iy0:iy1, ix0:ix1].sum()) if (box_area > 0 and area > 0) else 0
         coverage = inter / box_area if box_area > 0 else 0.0
         precision = inter / area if area > 0 else 0.0
-        if coverage < min_coverage:          # 框被覆盖太少，多半是框外飞溅，丢
-            continue
-        s = float(scores[i]) if scores is not None and len(scores) > i else 0.0
-        key = coverage * precision
-        # score 仅作极小权重的同分裂项，避免它主导（目标分可能很低）
-        key_tb = key + 1e-4 * s
-        if key_tb > best_key:
-            best_key = key_tb
-            best = (i, s, iou, coverage, precision)
 
-    if best is None:
+        non_empty = area_frac >= min_mask_frac
+        passed = (non_empty and area_frac <= max_mask_frac
+                  and precision >= min_precision and coverage >= min_coverage
+                  and iou >= min_iou)
+        if passed:
+            survivors.append((i, s, iou, area_frac, coverage, precision))
+        elif non_empty and iou >= min_iou and area_frac <= max_mask_frac:
+            # 兜底池：放宽 precision/coverage，但仍排除空 mask 与覆盖整图的背景块
+            fallback.append((i, s, iou, area_frac, coverage, precision))
+        if debug:
+            rows.append((i, round(s, 3), round(iou, 2), round(area_frac, 4),
+                         round(coverage, 3), round(precision, 3), passed))
+
+    pool = survivors if survivors else fallback
+    info["used_fallback"] = (not survivors) and bool(fallback)
+    if debug:
+        info["debug_rows"] = sorted(rows, key=lambda r: -r[1])[:12]
+    if not pool:
         return None, info
-    i, s, iou, coverage, precision = best
+
+    # 幸存候选里按 score 选（与 v1 一致），coverage 作极小权重同分裂项
+    i, s, iou, area_frac, coverage, precision = max(
+        pool, key=lambda r: (r[1] + 1e-3 * r[4]))
     info.update(score=round(s, 4), iou=round(iou, 4),
-                coverage=round(coverage, 4), precision=round(precision, 4))
+                coverage=round(coverage, 4), precision=round(precision, 4),
+                area=round(area_frac, 4), picked=int(i))
     if s < min_score:
         info["dropped_by_min_score"] = True
         return None, info
-    return probs[i].astype(np.float32), info
+    return (M[i] > 0).astype(np.uint8), info
 
 
 # ──────────────────────────────────────────────
 # 单图预测
 # ──────────────────────────────────────────────
+
+def _print_debug(name, bi, box, ebox, info):
+    """--debug：打印一个框的候选表与选中结果（用模型自带 masks 统计）。"""
+    print(f"  [{name} 框{bi}] box={[round(v,1) for v in box]} "
+          f"-> ebox={[round(v,1) for v in ebox]}  候选n={info.get('n_candidates')}")
+    rows = info.get("debug_rows") or []
+    if rows:
+        print("      idx  score   IoU   area  coverage  precision  通过")
+        for (i, s, iou, area, cov, prec, passed) in rows:
+            print(f"      {i:3d}  {s:6.3f}  {iou:4.2f}  {area:6.4f}  "
+                  f"{cov:7.3f}  {prec:8.3f}   {'√' if passed else '×'}")
+    fb = "（兜底池）" if info.get("used_fallback") else ""
+    print(f"      选中 -> #{info.get('picked')}{fb}  score={info.get('score')} "
+          f"area={info.get('area')} coverage={info.get('coverage')} "
+          f"precision={info.get('precision')}")
+
 
 def predict_one(
     processor: Sam3Processor,
@@ -194,7 +222,10 @@ def predict_one(
     min_iou: float,
     min_score: float,
     min_coverage: float,
+    min_precision: float,
+    max_mask_frac: float,
     keep_components: str,
+    debug: bool = False,
 ):
     """一张图、若干 CAM 框 -> (PIL 图, union mask, meta)。
 
@@ -208,7 +239,7 @@ def predict_one(
     union = np.zeros((H, W), dtype=np.uint8)
     meta_boxes = []
 
-    for box in boxes_xyxy:
+    for bi, box in enumerate(boxes_xyxy):
         processor.reset_all_prompts(state)
         ebox = expand_box(box, W, H, expand_ratio)
 
@@ -217,17 +248,20 @@ def predict_one(
         output = processor.add_geometric_prompt(
             box=xyxy_to_norm_cxcywh(ebox, W, H), label=True, state=state)
 
-        mask_prob, info = select_candidate(
+        mask_sel, info = select_candidate(
             output.get("masks_logits"), output.get("boxes"),
             output.get("scores"), ebox, min_iou=min_iou, min_score=min_score,
-            min_coverage=min_coverage, masks_bin=output.get("masks"))
+            min_coverage=min_coverage, min_precision=min_precision,
+            max_mask_frac=max_mask_frac,
+            masks_bin=output.get("masks"), debug=debug)
         info["prompt_box_xyxy"] = [round(v, 1) for v in ebox]
-        meta_boxes.append(info)
-        if mask_prob is None:
+        if debug:
+            _print_debug(image_path.name, bi, box, ebox, info)
+        meta_boxes.append({k: v for k, v in info.items() if k != "debug_rows"})
+        if mask_sel is None:
             continue
 
-        mask = (mask_prob > mask_threshold).astype(np.uint8)
-        mask = postprocess_mask(mask, ref_box=ebox, keep_components=keep_components)
+        mask = postprocess_mask(mask_sel, ref_box=ebox, keep_components=keep_components)
         union = np.logical_or(union, mask).astype(np.uint8)
 
     scores = [b["score"] for b in meta_boxes if b.get("score") is not None]
@@ -268,8 +302,9 @@ def run(args) -> None:
     text_prompt = None if args.no_text else args.text_prompt
 
     print(f"[3/3] 推理  text_prompt={text_prompt!r}  expand={args.expand_ratio}  "
-          f"选法=mask∩框coverage×precision  min_iou>{args.min_iou}  "
-          f"min_cov>{args.min_coverage}  mask>{args.mask_threshold}")
+          f"选法=框内候选 argmax(score)  min_iou>{args.min_iou}  "
+          f"min_prec>{args.min_precision}  min_cov>{args.min_coverage}"
+          f"{'  [debug]' if args.debug else ''}")
     for image_path, json_path in tqdm(pairs, desc="SAM3-v2"):
         boxes, size = load_boxes_json(json_path)
         if not boxes:
@@ -287,7 +322,10 @@ def run(args) -> None:
                     min_iou=args.min_iou,
                     min_score=args.conf_threshold,
                     min_coverage=args.min_coverage,
+                    min_precision=args.min_precision,
+                    max_mask_frac=args.max_mask_frac,
                     keep_components=args.keep_components,
+                    debug=args.debug,
                 )
         except Exception as e:
             tqdm.write(f"  {image_path.name} 推理异常: {e}")
@@ -326,13 +364,21 @@ if __name__ == "__main__":
                     help="SAM3 内部 confidence_threshold；默认 0 保留全部候选，"
                          "由 select_candidate 做空间/置信过滤。一般不用改")
     ap.add_argument("--mask-threshold", type=float, default=0.5,
-                    help="mask 二值化阈值（对 sigmoid(masks_logits) 的概率）；"
-                         "默认 0.5 = logit>0（等价模型自带 masks）；mask 偏小调低 0.3")
+                    help="（仅在模型未返回二值 masks、退回 logit 时生效）mask 二值化阈值；"
+                         "默认下直接用模型自带的 output['masks']（与 v1 一致）")
     ap.add_argument("--min-iou", type=float, default=0.1,
                     help="候选框与提示框最小 IoU（廉价空间初筛）")
     ap.add_argument("--min-coverage", type=float, default=0.0,
                     help="选中 mask 对提示框的最小覆盖率（|mask∩框|/|框|）；"
-                         "默认 0；假阳多时调 0.1~0.3 压框外飞溅")
+                         "默认 0；要求填满 CAM 框可调 0.1~0.3")
+    ap.add_argument("--min-precision", type=float, default=0.5,
+                    help="候选 mask 落在提示框内的最小比例（|mask∩框|/|mask|）；"
+                         "默认 0.5，主要用来踢掉框外飞溅/覆盖整图的候选；"
+                         "目标被误丢时调低（0.3），假阳多时调高（0.7）")
+    ap.add_argument("--max-mask-frac", type=float, default=0.6,
+                    help="候选 mask 面积占全图上限（超过视为覆盖整图的背景块，丢弃）")
+    ap.add_argument("--debug", action="store_true",
+                    help="打印每个框的候选表（score/IoU/area/coverage/precision/是否通过）与选中结果")
     ap.add_argument("--keep-components", default="overlap",
                     choices=["all", "largest", "overlap"],
                     help="后处理保留哪些连通域")
