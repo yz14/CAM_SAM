@@ -45,7 +45,7 @@ exemplar。框从"唯一信息源"降级为"空间锚点"，边界由概念决�
 `pick_best_mask` 直接 `argmax(scores)`。SAM3 输出的是**全图所有**过阈值
 实例，最高分实例完全可能在提示框之外（另一个息肉、反光点）。
 
-**改进**：`select_candidate()` 用 `score × IoU(候选框, 提示框)` 排序，
+**改进**：`select_candidate()` 不再盲取最高分（见 §2.3.2 的进一步修正），
 并用 `--min-iou` 硬过滤框外候选。
 
 ### 2.3.1 ⚠️ 回归修复：内部置信度阈值把「未见概念」的目标整批删空
@@ -75,13 +75,85 @@ out_masks = out_masks[keep]   # ← 不过阈值的实例在这里就被丢掉�
 
 这样「有 CAM 框 → 必能选出框内最匹配的实例」，概念分低也不会把目标删空。
 
-### 2.4 二值化阈值不可调，丢掉了概率信息
+### 2.3.2 ⚠️ 真正根因：最高分候选「框准但 mask 是空的」，按 score 选必然选空
 
-旧版用 `masks > 0`（processor 内部已按 0.5 二值化）。息肉边缘是
-渐变的，0.5 往往保守。
+> §2.3.1 把内部阈值置 0 后，整图仍分不出目标。`debug_sam3_v2.py` 把候选摊开看，
+> 才暴露真正的根因——**检测分(score) 和 mask 质量并不挂钩**。
 
-**改进**：直接用 `masks_logits`（sigmoid 概率图），`--mask-threshold`
-可调：欠分割调低（0.35），过分割调高（0.6）。不用重跑模型。
+服务器诊断输出（图 `C_AHX..M66_002`，text 模式，n=200 候选）：
+
+```
+ idx  score    IoU   score*IoU  maskArea  pred_box(px)            mask_bbox(px)
+  44   0.930   0.93     0.863   0.0001  [   16,  70, 789, 803]  [  24, 430, 409, 568]  ← 选中
+  41   0.104   0.34     0.035   0.1173  [  174,260, 670, 652]  [ 174, 254, 679, 659]  ← 真·息肉
+  98   0.080   0.46     0.037   0.1431  [  172,260, 683, 839]  [ 175, 256, 679, 836]
+```
+
+最高分的 #44：score 0.93、pred_box 与提示框 IoU 0.93（框几乎完美贴合），
+但 **maskArea≈0.0001（mask 基本是空的）**，且它的 mask_bbox 还跑到左下角、
+跟自己的 pred_box 都对不上。真正的息肉 mask 在 **score 仅 0.1** 的 #41/#98 里。
+旧的 `score × IoU` 选法（IoU 用的是 pred_box）必然选中 #44 → 阈值化后整图空白。
+
+这解释了为什么 §2.3.1 之后仍分不出、且调 `--conf-threshold` 毫无变化
+（被选中的就是空 mask，提不提分都一样）；也解释了为什么 v1 反而能分出来——
+v1 用模型自带的二值 `output["masks"]`（logit>0）+ 纯框 `argmax(score)`，
+而 v2 用 `masks_logits>0.5` + `score×IoU`，两处叠加把目标弄丢。
+
+#### 一次走偏的尝试：纯 `coverage × precision` 选法会被「覆盖整图的背景块」骗
+
+最初改成「按 coverage×precision 选、不看 score」，结果**整图被涂满**：外扩后的
+CAM 框很大（可占图像 ~44%），一个覆盖大半张图的背景候选 `coverage≈1`，它的
+`coverage×precision` 反而压过真正的息肉 → 选中整图块。教训：**coverage 奖励大
+mask，不能让它主导排序**。
+
+#### 最终改法：以 v1 为基准（用 `output["masks"]` + argmax(score)）+ 框内过滤
+
+v1（`endoscope_sam3.py`）确认能分出目标，它做两件事：用模型自带二值
+`output["masks"]`(logit>0) 当 mask、在候选里 `argmax(score)`。v2 之前坏在
+`masks_logits>0.5`（把真实 mask 侵蚀到近空）+ `score×IoU(pred_box)`（选中空 mask）。
+
+`select_candidate()` 改为**完全沿用 v1 的 mask 与选法**，只在前面加一层空间过滤：
+
+```
+# 每个候选（mask 用 output["masks"]）：
+#   area      = |mask| / 图像面积
+#   precision = |mask ∩ 提示框| / |mask|     有多少落在框内
+#   coverage  = |mask ∩ 提示框| / |提示框|   填满了多少框
+# 过滤（任一不满足即丢）：
+#   min_mask_frac ≤ area ≤ max_mask_frac     丢空 mask、丢覆盖整图的背景块
+#   precision ≥ --min-precision(默认0.5)     丢框外飞溅/整图（precision 很低）
+#   coverage  ≥ --min-coverage(默认0)        可选
+#   IoU(pred_box,框) ≥ --min-iou(默认0.1)    廉价空间初筛
+# 幸存候选里 argmax(coverage × precision)（填满框且不往框外漏 = 完整且贴合），score 作同分裂项
+# 若无人过 precision 门槛 -> 放宽到「非空+框内+不覆盖整图」再 argmax(score) 兜底
+```
+
+- `precision≥0.5` 是关键旋钮：整图块 precision=框/图≈0.17、框外飞溅 precision≈0，
+  都被它剔掉，而落在框内的目标 precision≈1.0 安全通过；
+- `max_mask_frac=0.6` 兜底再挡一道覆盖整图的候选；
+- **幸存候选按 coverage × precision 选**（两轮 `--debug` 调出来的）：
+  - 不能按 **score**：图1 框内 3 个候选（#92 area1.2% / #41 11.7% / #98 14.3%，
+    precision 都≈1），检测分与 mask 大小不挂钩，`argmax(score)` 选中**分最高但极小
+    的碎块 #92** → 整图变碎点；
+  - 也不能按纯 **coverage**：太脆。图2 里一个紧贴目标、**21% 在框外**的假阳
+    #165(cov0.242,prec0.79) 仅靠 coverage 高 0.006 就压过真目标 #137(cov0.236,prec1.0，
+    又准又高分) → 整个避开目标、全是假阳；
+  - **coverage × precision** 同时满足：让 precision 打破 coverage 的细微平局——
+    图2 #137=0.236×1.0=**0.236** > #165=0.242×0.79=0.191；图1 #98=0.323×0.991=**0.320** 仍最大。
+  - **这里用乘积安全**，因为覆盖整图/框外的候选已被 `precision≥0.5` + `max_mask_frac`
+    在前面硬剔掉了（这正是 PR #3 无 precision 门槛、纯 coverage×precision 翻车，而这
+    里不会翻车的关键区别）；
+- 若没有候选过 precision 门槛，放宽到「非空 + 框内 + 不覆盖整图」再 **argmax(score)**
+  （此时 mask 大半在框外，按 coverage 反而会放大框外飞溅）**兜底**，避免再次整图空白。
+
+### 2.4 mask 直接用模型自带二值 `output["masks"]`（与 v1 一致），不再用 logits 阈值
+
+关键教训：`masks_logits > 0.5` 与模型自带的 `output["masks"]` **差异极大**——诊断里
+最高分候选 `masks_logits>0.5` 面积≈0（看着像空），但 v1 用 `output["masks"]` 却能
+分出目标，说明二者根本不是同一个量（masks_logits 经阈值后会把真实 mask 侵蚀到近空）。
+
+**改进**：候选打分与最终 mask 都直接用 `output["masks"]`(logit>0)。`--mask-threshold`
+仅在模型未返回二值 `masks`、退回 `masks_logits` 时才生效，日常无需调。
 
 ### 2.5 缺少 mask 后处理
 
@@ -114,15 +186,22 @@ qa_sam3.py 里定义的坏例模式（碎成多块 / 框外飞溅 / 高光被抠
 
 | 症状 | 旋钮 | 方向 |
 |---|---|---|
-| mask 偏小 / 截断 | `--expand-ratio` / `--mask-threshold` | 0.12→0.2 / 0.5→0.35 |
-| mask 吞背景 | `--expand-ratio` / `--mask-threshold` | →0.05 / →0.6 |
-| 假阳太多（框周围杂块） | `--conf-threshold` / `--min-iou` | 0→0.3~0.5 / 0.1→0.3 |
-| 选错目标（框外实例） | `--min-iou` | 0.1→0.5 |
+| 目标被误丢 / 分不出 | `--min-precision` / `--min-iou` | 0.5→0.3 / 0.1→0.05 |
+| 假阳太多（框外飞溅） | `--min-precision` / `--min-coverage` / `--min-iou` | 0.5→0.7 / 0→0.2 / 0.1→0.3 |
+| 整图/大块被选中 | `--min-precision` / `--max-mask-frac` | →0.7 / 0.6→0.4 |
+| mask 偏小 / 截断 | `--expand-ratio` | 0.12→0.2 |
+| mask 吞背景 | `--expand-ratio` | →0.05 |
+| 看不懂为何这样选 | `--debug` | 打印候选表与选中原因 |
 | 想复现旧版对照 | `--no-text` | 关闭概念提示 |
 
-> 注意：`--conf-threshold` 现在是「选中候选」的**后置**得分下限（默认 0 = 有框
-> 必出目标），不再直接喂给 SAM3 内部阈值（详见 §2.3.1）。模型内部阈值由
-> `--model-conf-threshold` 控制，默认 0（保留全部候选），一般无需改动。
+> 注意：选候选先用空间过滤（precision/area/iou）圈出「框内、非空、不覆盖整图」的
+> 幸存候选，再在其中 `argmax(coverage × precision)`（填满框且不往框外漏 = 完整且贴合
+> 的目标）（见 §2.3.2）。注意乘积安全的前提是先有 precision/area 硬门槛——无门槛时纯
+> coverage×precision 会选整图（PR #3 翻车），纯 score 会选碎块、纯 coverage 会被框外
+> 假阳靠微弱 coverage 优势翻盘。**`--conf-threshold`（选中候选的 score 下限）
+> 默认 0，且不建议调高**——目标实例的 score 可能只有 ~0.1，调高会把目标一起丢掉；
+> 要压假阳请用 `--min-precision` / `--min-coverage` / `--min-iou`。模型内部阈值
+> `--model-conf-threshold` 默认 0（保留全部候选），勿动。
 
 ## 5. 验证方法（无 GT 时）
 
