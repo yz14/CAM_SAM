@@ -48,6 +48,33 @@ exemplar。框从"唯一信息源"降级为"空间锚点"，边界由概念决�
 **改进**：`select_candidate()` 用 `score × IoU(候选框, 提示框)` 排序，
 并用 `--min-iou` 硬过滤框外候选。
 
+### 2.3.1 ⚠️ 回归修复：内部置信度阈值把「未见概念」的目标整批删空
+
+> 这是 v2 第一版「连目标都分割不出来」的**直接根因**，务必理解。
+
+`Sam3Processor._forward_grounding()` 在出 mask 前有一步硬过滤：
+
+```python
+out_probs = pred_logits.sigmoid() * presence_logit.sigmoid()  # 概念匹配分 × 存在分
+keep = out_probs > self.confidence_threshold                  # 默认 0.4
+out_masks = out_masks[keep]   # ← 不过阈值的实例在这里就被丢掉了
+```
+
+通用 SAM3 的文本编码器是 CLIP，对 `"polyp"` 这类**分布外医学术语**对齐很差，
+`out_probs` 普遍很低。v2 第一版把 `--conf-threshold`（默认 0.4）直接喂给
+`confidence_threshold`，于是**与 CAM 框重叠的目标实例也被一起删空** → 候选数 0 →
+`select_candidate` 拿到空列表 → 整图 mask 全黑。
+
+（v1 纯 box prompt 没踩这个坑：文本退化成占位词 `"visual"`，box exemplar 让
+`presence`/匹配分都很高，`out_probs > 0.5` 仍能留下候选——代价是没有概念约束、假阳多。）
+
+**改进**：把「置信度过滤」从模型内部挪到候选选择之后。
+- `confidence_threshold` 固定置 **0**（`--model-conf-threshold`，保留全部候选）；
+- `--conf-threshold` 改为 `select_candidate` 里**选中候选**的后置得分下限，
+  默认 **0**（有框必出目标），误检多时再调高到 0.3~0.5 抑制假阳。
+
+这样「有 CAM 框 → 必能选出框内最匹配的实例」，概念分低也不会把目标删空。
+
 ### 2.4 二值化阈值不可调，丢掉了概率信息
 
 旧版用 `masks > 0`（processor 内部已按 0.5 二值化）。息肉边缘是
@@ -89,9 +116,13 @@ qa_sam3.py 里定义的坏例模式（碎成多块 / 框外飞溅 / 高光被抠
 |---|---|---|
 | mask 偏小 / 截断 | `--expand-ratio` / `--mask-threshold` | 0.12→0.2 / 0.5→0.35 |
 | mask 吞背景 | `--expand-ratio` / `--mask-threshold` | →0.05 / →0.6 |
-| 整图无输出（漏检） | `--conf-threshold` | 0.4→0.25 |
+| 假阳太多（框周围杂块） | `--conf-threshold` / `--min-iou` | 0→0.3~0.5 / 0.1→0.3 |
 | 选错目标（框外实例） | `--min-iou` | 0.1→0.5 |
 | 想复现旧版对照 | `--no-text` | 关闭概念提示 |
+
+> 注意：`--conf-threshold` 现在是「选中候选」的**后置**得分下限（默认 0 = 有框
+> 必出目标），不再直接喂给 SAM3 内部阈值（详见 §2.3.1）。模型内部阈值由
+> `--model-conf-threshold` 控制，默认 0（保留全部候选），一般无需改动。
 
 ## 5. 验证方法（无 GT 时）
 
