@@ -6,3 +6,4 @@ __pycache__/
 *.pth
 imgs
 pku1_convnext_base
+medsam3
