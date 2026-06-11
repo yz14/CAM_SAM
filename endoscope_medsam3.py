@@ -60,7 +60,7 @@ from tqdm import tqdm
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
-from endoscope_sam3_v2 import select_candidate
+from endoscope_sam3_v2 import _sigmoid, select_candidate
 from seg_common import (
     check_size_consistency,
     collect_pairs,
@@ -168,8 +168,9 @@ def predict_text_only(processor: Sam3Processor, image: Image.Image,
     inst_scores = []
     if masks_logits is not None and len(masks_logits) > 0:
         masks_logits = squeeze_masks(masks_logits)
+        probs = _sigmoid(masks_logits)   # masks_logits 是 logit，先转概率再阈值
         for i in range(len(masks_logits)):
-            m = (masks_logits[i] > mask_threshold).astype(np.uint8)
+            m = (probs[i] > mask_threshold).astype(np.uint8)
             m = postprocess_mask(m, ref_box=None,
                                  keep_components=("largest" if keep_components == "overlap"
                                                   else keep_components))
@@ -203,7 +204,8 @@ def predict_with_boxes(processor: Sam3Processor, image: Image.Image,
 
         mask_prob, info = select_candidate(
             output.get("masks_logits"), output.get("boxes"),
-            output.get("scores"), ebox, min_iou=min_iou)
+            output.get("scores"), ebox, min_iou=min_iou,
+            masks_bin=output.get("masks"))
         info["prompt_box_xyxy"] = [round(v, 1) for v in ebox]
         meta_boxes.append(info)
         if mask_prob is None:

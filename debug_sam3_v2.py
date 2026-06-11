@@ -10,11 +10,13 @@
   - 候选总数 n
   - 候选列表（按 score 排序）：pred_box(像素 xyxy 原值)、score、
     IoU(候选框, 提示框)、mask 面积占比、mask 外接框
-  - 三种"选法"各自会选中谁，便于对比：
+  - 四种"选法"各自会选中谁，便于对比：
       * argmax(score)              —— v1 的选法
-      * argmax(score × IoU)        —— v2 select_candidate 的选法
+      * argmax(score × IoU)        —— v2 旧 select_candidate 的选法
       * argmax(IoU)                —— 纯空间最近
-分别在 text 模式与 no-text 模式各跑一遍，并存 overlay 方便目检。
+      * argmax(cov×prec)           —— v2 新 select_candidate（mask∩框契合度）★
+overlay 用**新选法**（与修复后的 endoscope_sam3_v2.py 一致）画出，方便直接目检
+目标是否被正确分出。分别在 text 模式与 no-text 模式各跑一遍。
 
 用法::
 
@@ -40,6 +42,7 @@ from tqdm import tqdm
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
+from endoscope_sam3_v2 import select_candidate
 from seg_common import (
     box_iou_xyxy,
     collect_pairs,
@@ -52,6 +55,19 @@ from seg_common import (
     to_numpy,
     xyxy_to_norm_cxcywh,
 )
+
+
+def _cov_prec(mask_bin, ebox, W, H):
+    """mask 与提示框的 coverage(|m∩box|/|box|) 与 precision(|m∩box|/|m|)。"""
+    x0, y0, x1, y1 = ebox
+    ix0, iy0 = max(int(round(x0)), 0), max(int(round(y0)), 0)
+    ix1, iy1 = min(int(round(x1)), W), min(int(round(y1)), H)
+    box_area = max(ix1 - ix0, 0) * max(iy1 - iy0, 0)
+    area = int(mask_bin.sum())
+    if area == 0 or box_area == 0:
+        return 0.0, 0.0
+    inter = int(mask_bin[iy0:iy1, ix0:ix1].sum())
+    return inter / box_area, inter / area
 
 
 def _dump_candidates(output, ebox, W, H, top_k=12):
@@ -77,29 +93,33 @@ def _dump_candidates(output, ebox, W, H, top_k=12):
         pb = boxes[i].tolist() if boxes is not None else [0, 0, 0, 0]
         s = float(scores[i]) if scores is not None and len(scores) > i else 0.0
         iou = box_iou_xyxy(pb, ebox)
-        area = float((masks[i] > 0.5).mean())  # mask 面积占全图比例
-        mbox = mask_to_xyxy((masks[i] > 0.5).astype(np.uint8))
-        rows.append((i, s, iou, s * max(iou, 1e-3), area, pb, mbox))
+        bm = (masks[i] > 0.5).astype(np.uint8)
+        area = float(bm.mean())  # mask 面积占全图比例
+        cov, prec = _cov_prec(bm, ebox, W, H)
+        mbox = mask_to_xyxy(bm)
+        rows.append((i, s, iou, cov * prec, area, pb, mbox, cov, prec))
 
     # 按 score 降序打印
-    print("        idx  score    IoU   score*IoU  maskArea  pred_box(px)            mask_bbox(px)")
-    for (i, s, iou, key, area, pb, mbox) in sorted(rows, key=lambda r: -r[1])[:top_k]:
+    print("        idx  score    IoU   cov*prec  maskArea  pred_box(px)            mask_bbox(px)")
+    for (i, s, iou, key, area, pb, mbox, cov, prec) in sorted(rows, key=lambda r: -r[1])[:top_k]:
         pb_s = "[" + ",".join(f"{v:6.0f}" for v in pb) + "]"
         mb_s = ("[" + ",".join(f"{v:6.0f}" for v in mbox) + "]") if mbox else "None"
         print(f"        {i:3d}  {s:6.3f}  {iou:5.2f}  {key:8.3f}  {area:7.4f}  {pb_s}  {mb_s}")
 
     def _argmax(keyfn):
         best, bi = -1.0, None
-        for (i, s, iou, key, area, pb, mbox) in rows:
-            v = keyfn(s, iou, key)
+        for r in rows:
+            v = keyfn(*r)
             if v > best:
-                best, bi = v, i
+                best, bi = v, r[0]
         return bi
-    i_score = _argmax(lambda s, iou, key: s)
-    i_mix = _argmax(lambda s, iou, key: key)
-    i_iou = _argmax(lambda s, iou, key: iou)
+    i_score = _argmax(lambda i, s, iou, key, *a: s)
+    i_mix = _argmax(lambda i, s, iou, key, *a: s * max(iou, 1e-3))
+    i_iou = _argmax(lambda i, s, iou, key, *a: iou)
+    i_cp = _argmax(lambda i, s, iou, key, *a: key)
     print(f"      选法对比: argmax(score)=#{i_score}  "
-          f"argmax(score*IoU)=#{i_mix}  argmax(IoU)=#{i_iou}")
+          f"argmax(score*IoU)=#{i_mix}  argmax(IoU)=#{i_iou}  "
+          f"argmax(cov*prec)=#{i_cp} ★新选法")
     return masks, boxes, scores
 
 
@@ -120,16 +140,13 @@ def _run_mode(processor, image, boxes_xyxy, text_prompt, expand_ratio, W, H,
         masks, pboxes, scores = _dump_candidates(output, ebox, W, H)
         if masks is None or len(masks) == 0:
             continue
-        # 用 argmax(score*IoU) 选中的那个画进 union（与 v2 一致），仅供目检
-        best, bi2 = -1.0, None
-        for i in range(len(masks)):
-            pb = pboxes[i].tolist()
-            s = float(scores[i]) if scores is not None and len(scores) > i else 0.0
-            key = s * max(box_iou_xyxy(pb, ebox), 1e-3)
-            if key > best:
-                best, bi2 = key, i
-        if bi2 is not None:
-            m = (masks[bi2] > mask_threshold).astype(np.uint8)
+        # overlay 用**新** select_candidate（mask∩框契合度），与修复后 v2 一致
+        mask_prob, info = select_candidate(
+            output.get("masks_logits"), output.get("boxes"),
+            output.get("scores"), ebox, masks_bin=output.get("masks"))
+        print(f"      新选法选中: {info}")
+        if mask_prob is not None:
+            m = (mask_prob > mask_threshold).astype(np.uint8)
             m = postprocess_mask(m, ref_box=ebox, keep_components="overlap")
             union = np.logical_or(union, m).astype(np.uint8)
     save_overlay(image, union, boxes_xyxy, out_overlay)
