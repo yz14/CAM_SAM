@@ -115,10 +115,11 @@ def select_candidate(masks_logits, pred_boxes, scores, prompt_box_xyxy,
       - coverage  ≥ min_coverage（默认 0）       —— 可选，进一步要求填满框
       - IoU(候选框, 提示框) ≥ min_iou            —— 廉价空间初筛
     幸存候选（已过 precision/area 门槛 = 框内、非空、不覆盖整图）里取
-    **argmax(coverage)**（填满 CAM 框最多 = 完整目标），score 作同分裂项——
-    因为检测分(score)与 mask 大小不挂钩，纯 argmax(score) 会选中分高但极小的碎块。
-    若没有候选通过 precision 门槛，则放宽到「非空 + IoU + 不覆盖整图」再
-    argmax(score)（与 v1 一致）兜底，保证「有框尽量出目标」，不至于整图空白。
+    **argmax(coverage × precision)**（填满框且不往框外漏 = 完整且贴合的目标），
+    score 作同分裂项——纯 score 会选分高但极小的碎块；纯 coverage 又太脆，会让
+    一个紧贴目标、略大但部分在框外的假阳靠微弱 coverage 优势翻盘，用 precision
+    打破平局即可。若没有候选通过 precision 门槛，则放宽到「非空 + IoU + 不覆盖整图」
+    再 argmax(score)（与 v1 一致）兜底，保证「有框尽量出目标」，不至于整图空白。
 
     ⚠️ 关键：用 ``masks_bin``(=output["masks"]) 作权威 mask，**不要**用
     ``masks_logits > 阈值``——诊断显示二者差异极大（masks_logits>0.5 常把真实
@@ -184,15 +185,20 @@ def select_candidate(masks_logits, pred_boxes, scores, prompt_box_xyxy,
 
     # 排序键：
     #   幸存池（已过 precision≥min_precision + area≤max_mask_frac，即「框内、非空、
-    #   不覆盖整图」）按 coverage（填满 CAM 框最多）选——检测分(score)与 mask 大小
-    #   不挂钩，纯 argmax(score) 会选中分高但极小的碎块（debug 实测 #92），故改用
-    #   coverage 选「填满框的完整目标」；因 precision 门槛已剔掉覆盖整图/框外的候选，
-    #   这里用 coverage 不会再整图涂满。score 作同分裂项。
-    #   兜底池（precision 没过门槛、mask 大半在框外）改回 argmax(score)（与 v1 一致），
-    #   此时按 coverage 反而可能放大框外飞溅。
+    #   不覆盖整图」）按 coverage × precision 选——
+    #     · 检测分(score)与 mask 大小不挂钩，纯 argmax(score) 会选中分高但极小的碎块
+    #       （debug 图1 #92）；
+    #     · 纯 coverage 又太脆：debug 图2 里一个紧贴目标、21% 在框外的假阳 #165
+    #       (cov0.242,prec0.79) 仅靠 coverage 高 0.006 就压过真目标 #137(cov0.236,prec1.0)。
+    #   coverage×precision 让 precision 打破 coverage 的细微平局：
+    #     图2 #137=0.236×1.0=0.236 > #165=0.242×0.79=0.191 ✓；图1 #98=0.323×0.991=0.320 仍最大 ✓。
+    #   ⚠️ 与翻车的 PR#3 不同：那次没有 precision 硬门槛，覆盖整图的背景块(prec≈0.17)能进
+    #   排序池；现在它们已被 precision≥0.5 + max_mask_frac 在前面剔掉，故这里用乘积安全。
+    #   score 作同分裂项。兜底池（precision 没过门槛、mask 大半在框外）改回 argmax(score)
+    #   （与 v1 一致），此时按 coverage 反而会放大框外飞溅。
     if survivors:
         i, s, iou, area_frac, coverage, precision = max(
-            pool, key=lambda r: (r[4], r[1]))
+            pool, key=lambda r: (r[4] * r[5], r[1]))
     else:
         i, s, iou, area_frac, coverage, precision = max(
             pool, key=lambda r: (r[1], r[4]))
@@ -315,7 +321,7 @@ def run(args) -> None:
     text_prompt = None if args.no_text else args.text_prompt
 
     print(f"[3/3] 推理  text_prompt={text_prompt!r}  expand={args.expand_ratio}  "
-          f"选法=框内候选 argmax(score)  min_iou>{args.min_iou}  "
+          f"选法=框内候选 argmax(coverage×precision)  min_iou>{args.min_iou}  "
           f"min_prec>{args.min_precision}  min_cov>{args.min_coverage}"
           f"{'  [debug]' if args.debug else ''}")
     for image_path, json_path in tqdm(pairs, desc="SAM3-v2"):
