@@ -193,7 +193,7 @@ def predict_with_boxes(processor: Sam3Processor, image: Image.Image,
     """文本 + CAM 框模式：框作为概念的正样例锚点，逐框选候选取并集。
 
     选候选与 endoscope_sam3_v2.py 一致：用模型自带二值 ``output["masks"]``，
-    在「框内、非空、不覆盖整图」的候选里 ``argmax(score)``。
+    在「框内、非空、不覆盖整图」的候选里 ``argmax(coverage × precision)``。
     """
     W, H = image.size
     state = processor.set_image(image)
@@ -239,7 +239,7 @@ def run(args) -> None:
 
     pairs = collect_pairs(args.image, args.boxes)
     mode = "text+box" if args.boxes else "text_only"
-    sel = (f"选法=框内 argmax(score) min_iou>{args.min_iou} min_prec>{args.min_precision}"
+    sel = (f"选法=框内 argmax(coverage×precision) min_iou>{args.min_iou} min_prec>{args.min_precision}"
            if args.boxes else f"conf>{args.conf_threshold}")
     print(f"[4/4] 推理  mode={mode}  prompt={args.text_prompt!r}  "
           f"{sel}  mask>{args.mask_threshold}  共 {len(pairs)} 张"
