@@ -124,15 +124,21 @@ v1（`endoscope_sam3.py`）确认能分出目标，它做两件事：用模型�
 #   precision ≥ --min-precision(默认0.5)     丢框外飞溅/整图（precision 很低）
 #   coverage  ≥ --min-coverage(默认0)        可选
 #   IoU(pred_box,框) ≥ --min-iou(默认0.1)    廉价空间初筛
-# 幸存候选里 argmax(score)（与 v1 一致），coverage 作极小权重同分裂项
+# 幸存候选里 argmax(coverage)（填满 CAM 框最多 = 完整目标），score 作同分裂项
+# 若无人过 precision 门槛 -> 放宽到「非空+框内+不覆盖整图」再 argmax(score) 兜底
 ```
 
 - `precision≥0.5` 是关键旋钮：整图块 precision=框/图≈0.17、框外飞溅 precision≈0，
   都被它剔掉，而落在框内的目标 precision≈1.0 安全通过；
 - `max_mask_frac=0.6` 兜底再挡一道覆盖整图的候选；
-- 若没有候选过 precision 门槛，放宽到「非空 + 框内 + 不覆盖整图」再 argmax(score) **兜底**，
-  避免再次整图空白；
-- score 仍是主排序键（沿用 v1 找目标的能力），不会被某个大背景块的 coverage 带偏。
+- **幸存候选按 coverage 选、不按 score**：`--debug` 实测发现框内有 3 个候选
+  （#92 area1.2% / #41 area11.7% / #98 area14.3%，precision 都≈1），检测分(score)
+  与 mask 大小不挂钩——纯 argmax(score) 会选中**分最高但极小的碎块 #92**（整图变碎点），
+  改按 coverage 选「填满框的完整目标」#98。**这次用 coverage 安全**，因为覆盖整图/
+  框外的候选已被 `precision≥0.5` + `max_mask_frac` 在前面剔掉了（这正是 PR #3 纯
+  coverage×precision 翻车、而这里不会翻车的区别）；
+- 若没有候选过 precision 门槛，放宽到「非空 + 框内 + 不覆盖整图」再 **argmax(score)**
+  （此时 mask 大半在框外，按 coverage 反而会放大框外飞溅）**兜底**，避免再次整图空白。
 
 ### 2.4 mask 直接用模型自带二值 `output["masks"]`（与 v1 一致），不再用 logits 阈值
 
@@ -182,8 +188,9 @@ qa_sam3.py 里定义的坏例模式（碎成多块 / 框外飞溅 / 高光被抠
 | 看不懂为何这样选 | `--debug` | 打印候选表与选中原因 |
 | 想复现旧版对照 | `--no-text` | 关闭概念提示 |
 
-> 注意：选候选以 **v1 为基准**——在「框内、非空、不覆盖整图」的候选里 `argmax(score)`
-> （见 §2.3.2），不是 coverage×precision。**`--conf-threshold`（选中候选的 score 下限）
+> 注意：选候选先用空间过滤（precision/area/iou）圈出「框内、非空、不覆盖整图」的
+> 幸存候选，再在其中 `argmax(coverage)`（填满框最多 = 完整目标）（见 §2.3.2），
+> 既不是纯 coverage×precision（会选整图）、也不是纯 argmax(score)（会选碎块）。**`--conf-threshold`（选中候选的 score 下限）
 > 默认 0，且不建议调高**——目标实例的 score 可能只有 ~0.1，调高会把目标一起丢掉；
 > 要压假阳请用 `--min-precision` / `--min-coverage` / `--min-iou`。模型内部阈值
 > `--model-conf-threshold` 默认 0（保留全部候选），勿动。

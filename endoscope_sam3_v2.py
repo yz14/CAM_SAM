@@ -114,9 +114,11 @@ def select_candidate(masks_logits, pred_boxes, scores, prompt_box_xyxy,
       - precision ≥ min_precision                —— 丢框外飞溅/整图（它们 precision 很低）
       - coverage  ≥ min_coverage（默认 0）       —— 可选，进一步要求填满框
       - IoU(候选框, 提示框) ≥ min_iou            —— 廉价空间初筛
-    幸存候选里取 argmax(score)（与 v1 一致），coverage 作同分裂项。
-    若没有候选通过 precision 门槛，则放宽到「非空 + IoU」再 argmax(score) 兜底，
-    保证「有框尽量出目标」，不至于像之前那样整图空白。
+    幸存候选（已过 precision/area 门槛 = 框内、非空、不覆盖整图）里取
+    **argmax(coverage)**（填满 CAM 框最多 = 完整目标），score 作同分裂项——
+    因为检测分(score)与 mask 大小不挂钩，纯 argmax(score) 会选中分高但极小的碎块。
+    若没有候选通过 precision 门槛，则放宽到「非空 + IoU + 不覆盖整图」再
+    argmax(score)（与 v1 一致）兜底，保证「有框尽量出目标」，不至于整图空白。
 
     ⚠️ 关键：用 ``masks_bin``(=output["masks"]) 作权威 mask，**不要**用
     ``masks_logits > 阈值``——诊断显示二者差异极大（masks_logits>0.5 常把真实
@@ -180,9 +182,20 @@ def select_candidate(masks_logits, pred_boxes, scores, prompt_box_xyxy,
     if not pool:
         return None, info
 
-    # 幸存候选里按 score 选（与 v1 一致），coverage 作极小权重同分裂项
-    i, s, iou, area_frac, coverage, precision = max(
-        pool, key=lambda r: (r[1] + 1e-3 * r[4]))
+    # 排序键：
+    #   幸存池（已过 precision≥min_precision + area≤max_mask_frac，即「框内、非空、
+    #   不覆盖整图」）按 coverage（填满 CAM 框最多）选——检测分(score)与 mask 大小
+    #   不挂钩，纯 argmax(score) 会选中分高但极小的碎块（debug 实测 #92），故改用
+    #   coverage 选「填满框的完整目标」；因 precision 门槛已剔掉覆盖整图/框外的候选，
+    #   这里用 coverage 不会再整图涂满。score 作同分裂项。
+    #   兜底池（precision 没过门槛、mask 大半在框外）改回 argmax(score)（与 v1 一致），
+    #   此时按 coverage 反而可能放大框外飞溅。
+    if survivors:
+        i, s, iou, area_frac, coverage, precision = max(
+            pool, key=lambda r: (r[4], r[1]))
+    else:
+        i, s, iou, area_frac, coverage, precision = max(
+            pool, key=lambda r: (r[1], r[4]))
     info.update(score=round(s, 4), iou=round(iou, 4),
                 coverage=round(coverage, 4), precision=round(precision, 4),
                 area=round(area_frac, 4), picked=int(i))
