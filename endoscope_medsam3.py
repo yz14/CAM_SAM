@@ -60,7 +60,7 @@ from tqdm import tqdm
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
-from endoscope_sam3_v2 import _sigmoid, select_candidate
+from endoscope_sam3_v2 import _print_debug, _sigmoid, select_candidate
 from seg_common import (
     check_size_consistency,
     collect_pairs,
@@ -187,31 +187,38 @@ def predict_text_only(processor: Sam3Processor, image: Image.Image,
 
 def predict_with_boxes(processor: Sam3Processor, image: Image.Image,
                        boxes_xyxy, text_prompt: str, expand_ratio: float,
-                       mask_threshold: float, min_iou: float,
-                       keep_components: str):
-    """文本 + CAM 框模式：框作为概念的正样例锚点，逐框选候选取并集。"""
+                       min_iou: float, min_precision: float,
+                       max_mask_frac: float, keep_components: str,
+                       name: str = "", debug: bool = False):
+    """文本 + CAM 框模式：框作为概念的正样例锚点，逐框选候选取并集。
+
+    选候选与 endoscope_sam3_v2.py 一致：用模型自带二值 ``output["masks"]``，
+    在「框内、非空、不覆盖整图」的候选里 ``argmax(score)``。
+    """
     W, H = image.size
     state = processor.set_image(image)
     union = np.zeros((H, W), dtype=np.uint8)
     meta_boxes = []
 
-    for box in boxes_xyxy:
+    for bi, box in enumerate(boxes_xyxy):
         processor.reset_all_prompts(state)
         ebox = expand_box(box, W, H, expand_ratio)
         processor.set_text_prompt(text_prompt, state)
         output = processor.add_geometric_prompt(
             box=xyxy_to_norm_cxcywh(ebox, W, H), label=True, state=state)
 
-        mask_prob, info = select_candidate(
+        mask_sel, info = select_candidate(
             output.get("masks_logits"), output.get("boxes"),
             output.get("scores"), ebox, min_iou=min_iou,
-            masks_bin=output.get("masks"))
+            min_precision=min_precision, max_mask_frac=max_mask_frac,
+            masks_bin=output.get("masks"), debug=debug)
         info["prompt_box_xyxy"] = [round(v, 1) for v in ebox]
-        meta_boxes.append(info)
-        if mask_prob is None:
+        if debug:
+            _print_debug(name, bi, box, ebox, info)
+        meta_boxes.append({k: v for k, v in info.items() if k != "debug_rows"})
+        if mask_sel is None:
             continue
-        mask = (mask_prob > mask_threshold).astype(np.uint8)
-        mask = postprocess_mask(mask, ref_box=ebox, keep_components=keep_components)
+        mask = postprocess_mask(mask_sel, ref_box=ebox, keep_components=keep_components)
         union = np.logical_or(union, mask).astype(np.uint8)
 
     scores = [b["score"] for b in meta_boxes if b.get("score") is not None]
@@ -232,8 +239,11 @@ def run(args) -> None:
 
     pairs = collect_pairs(args.image, args.boxes)
     mode = "text+box" if args.boxes else "text_only"
+    sel = (f"选法=框内 argmax(score) min_iou>{args.min_iou} min_prec>{args.min_precision}"
+           if args.boxes else f"conf>{args.conf_threshold}")
     print(f"[4/4] 推理  mode={mode}  prompt={args.text_prompt!r}  "
-          f"conf>{args.conf_threshold}  mask>{args.mask_threshold}  共 {len(pairs)} 张")
+          f"{sel}  mask>{args.mask_threshold}  共 {len(pairs)} 张"
+          f"{'  [debug]' if args.debug else ''}")
 
     out_root = Path(args.output)
     for image_path, json_path in tqdm(pairs, desc="MedSAM3"):
@@ -248,8 +258,9 @@ def run(args) -> None:
                 if boxes:
                     mask, meta = predict_with_boxes(
                         processor, image, boxes, args.text_prompt,
-                        args.expand_ratio, args.mask_threshold,
-                        args.min_iou, args.keep_components)
+                        args.expand_ratio, args.min_iou, args.min_precision,
+                        args.max_mask_frac, args.keep_components,
+                        name=image_path.name, debug=args.debug)
                 else:
                     mask, meta = predict_text_only(
                         processor, image, args.text_prompt,
@@ -296,8 +307,15 @@ if __name__ == "__main__":
     ap.add_argument("--mask-threshold", type=float, default=0.5,
                     help="mask 概率二值化阈值")
     ap.add_argument("--min-iou", type=float, default=0.1,
-                    help="（文本+框模式）候选框与提示框最小 IoU")
+                    help="（文本+框模式）候选框与提示框最小 IoU（廉价空间初筛）")
+    ap.add_argument("--min-precision", type=float, default=0.5,
+                    help="（文本+框模式）候选 mask 落在框内的最小比例（|mask∩框|/|mask|）；"
+                         "默认 0.5，踢掉框外飞溅/覆盖整图的候选；目标被误丢调低 0.3")
+    ap.add_argument("--max-mask-frac", type=float, default=0.6,
+                    help="（文本+框模式）候选 mask 面积占全图上限（超过视为背景块，丢弃）")
     ap.add_argument("--keep-components", default="overlap",
                     choices=["all", "largest", "overlap"])
+    ap.add_argument("--debug", action="store_true",
+                    help="（文本+框模式）打印每个框的候选表与选中原因")
     ap.add_argument("--no-overlay", action="store_true", help="不存 overlay 检查图")
     run(ap.parse_args())
