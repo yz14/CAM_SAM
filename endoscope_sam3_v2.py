@@ -12,12 +12,16 @@ docs/sam3_polyp_improvement.md 的分析）：
    默认外扩 12%，把病灶边缘留在提示框内。
 3. **候选选择策略**：不再盲取全图最高分实例（概念模式下可能选到
    框外的其它息肉），改为 score × IoU(候选框, 提示框) 混合排序。
+   **置信度过滤放在选完之后**：SAM3 内部 confidence_threshold 置 0、
+   保留全部候选，避免「polyp」这类未见医学概念的低匹配分把目标实例
+   在出 mask 前就整批删空（这正是 v2 之前「连目标都分割不出来」的根因）。
 4. **mask 二值化阈值可调**：直接用 ``masks_logits``（概率图），
    欠分割时调低 --mask-threshold 即可外扩 mask，无需重跑模型。
 5. **mask 后处理**：只保留与提示框相交的连通域 + 补洞 + 闭运算，
    消掉「碎成多块 / 框外飞溅 / 高光被抠洞」三类常见坏例。
-6. **置信度阈值可调 + meta 落盘**：--conf-threshold 控制召回，
-   每图写 meta/<stem>.json（score/iou/候选数），qa_sam3.py --meta 直接可用。
+6. **置信度后置过滤 + meta 落盘**：--conf-threshold 是选中候选的后置得分
+   下限（默认 0 不过滤），每图写 meta/<stem>.json（score/iou/候选数），
+   qa_sam3.py --meta 直接可用。
 7. **每图只编码一次图像**：多框时复用 image embedding（reset 提示而非
    重跑 backbone），推理显著提速。
 
@@ -42,10 +46,15 @@ docs/sam3_polyp_improvement.md 的分析）：
 
 调参速查（结果不理想时按顺序试）
 --------------------------------
-- 漏分割/mask 偏小：--expand-ratio 0.2、--mask-threshold 0.35、--conf-threshold 0.3
+- 漏分割/mask 偏小：--expand-ratio 0.2、--mask-threshold 0.35
 - 过分割/吞背景：--expand-ratio 0.05、--mask-threshold 0.6
+- 假阳太多：--conf-threshold 0.3~0.5（后置过滤掉低分选中候选）、--min-iou 0.3
 - 选错目标：--min-iou 0.5（强制候选框与提示框重叠）
 - 想对比旧行为：--no-text（退回纯 box prompt，仅保留外扩与后处理）
+
+注意：--conf-threshold 现在是「选中候选」的后置得分下限（默认 0 = 有框必出
+目标），不再直接喂给 SAM3 内部阈值；内部阈值由 --model-conf-threshold 控制，
+默认 0（保留全部候选）。
 """
 
 from __future__ import annotations
@@ -80,7 +89,7 @@ from seg_common import (
 # ──────────────────────────────────────────────
 
 def select_candidate(masks_logits, pred_boxes, scores, prompt_box_xyxy,
-                     min_iou: float = 0.0):
+                     min_iou: float = 0.0, min_score: float = 0.0):
     """从 SAM3 输出的候选实例中选最匹配提示框的一个。
 
     返回 (mask_prob (H,W) float, info dict)；无合格候选返回 (None, info)。
@@ -88,6 +97,13 @@ def select_candidate(masks_logits, pred_boxes, scores, prompt_box_xyxy,
     排序键 = score × max(IoU, eps)：概念模式下 SAM3 会输出全图所有同概念
     实例，单纯取 argmax(score) 可能选到框外的其它息肉；乘 IoU 把空间先验
     拉回来。min_iou 用于硬过滤明显不在框内的候选。
+
+    min_score 是对「最终选中候选」的得分下限（后置过滤，默认 0 不过滤）。
+    注意：这里做置信度过滤，而不是用 SAM3 内部的 confidence_threshold ——
+    后者会在出 mask 前就把低分实例整批删掉。对「polyp」这类 SAM3 没见过的
+    医学概念，概念匹配分会很低，内部阈值（默认 0.4）会把目标实例也一起删空，
+    导致整图无输出。改成内部阈值置 0（全保留）+ 这里按 score×IoU 选 + min_score
+    后置过滤，既保证有框就一定能选出目标，又能抑制假阳。
     """
     masks_logits = to_numpy(masks_logits)
     pred_boxes = to_numpy(pred_boxes)
@@ -113,6 +129,9 @@ def select_candidate(masks_logits, pred_boxes, scores, prompt_box_xyxy,
         return None, info
     i, s, iou = best
     info.update(score=round(s, 4), iou=round(iou, 4))
+    if s < min_score:
+        info["dropped_by_min_score"] = True
+        return None, info
     return masks_logits[i].astype(np.float32), info
 
 
@@ -128,6 +147,7 @@ def predict_one(
     expand_ratio: float,
     mask_threshold: float,
     min_iou: float,
+    min_score: float,
     keep_components: str,
 ):
     """一张图、若干 CAM 框 -> (PIL 图, union mask, meta)。
@@ -153,7 +173,7 @@ def predict_one(
 
         mask_prob, info = select_candidate(
             output.get("masks_logits"), output.get("boxes"),
-            output.get("scores"), ebox, min_iou=min_iou)
+            output.get("scores"), ebox, min_iou=min_iou, min_score=min_score)
         info["prompt_box_xyxy"] = [round(v, 1) for v in ebox]
         meta_boxes.append(info)
         if mask_prob is None:
@@ -187,8 +207,11 @@ def run(args) -> None:
         eval_mode=True,
     )
     model.eval()
+    # 关键：内部 confidence_threshold 置 0，让 SAM3 保留所有候选实例（包括与
+    # CAM 框重叠的目标），把置信度/空间过滤交给 select_candidate。否则「polyp」
+    # 这类未见医学概念的匹配分偏低，内部阈值会在出 mask 前就把目标删空 -> 整图无输出。
     processor = Sam3Processor(model, device=args.device,
-                              confidence_threshold=args.conf_threshold)
+                              confidence_threshold=args.model_conf_threshold)
 
     print("[2/3] 收集 (图片, boxes) 配对")
     pairs = collect_pairs(args.image, args.boxes)
@@ -198,7 +221,8 @@ def run(args) -> None:
     text_prompt = None if args.no_text else args.text_prompt
 
     print(f"[3/3] 推理  text_prompt={text_prompt!r}  expand={args.expand_ratio}  "
-          f"conf>{args.conf_threshold}  mask>{args.mask_threshold}")
+          f"model_conf>{args.model_conf_threshold}  pick_score>{args.conf_threshold}  "
+          f"mask>{args.mask_threshold}")
     for image_path, json_path in tqdm(pairs, desc="SAM3-v2"):
         boxes, size = load_boxes_json(json_path)
         if not boxes:
@@ -214,6 +238,7 @@ def run(args) -> None:
                     expand_ratio=args.expand_ratio,
                     mask_threshold=args.mask_threshold,
                     min_iou=args.min_iou,
+                    min_score=args.conf_threshold,
                     keep_components=args.keep_components,
                 )
         except Exception as e:
@@ -245,8 +270,13 @@ if __name__ == "__main__":
                     help="关闭文本提示，退回纯 box prompt（对照旧版行为）")
     ap.add_argument("--expand-ratio", type=float, default=0.12,
                     help="bbox 按宽高比例外扩（0 关闭）；CAM 框偏紧时调大")
-    ap.add_argument("--conf-threshold", type=float, default=0.4,
-                    help="SAM3 实例置信度阈值；漏检调低，误检调高")
+    ap.add_argument("--conf-threshold", type=float, default=0.0,
+                    help="选中候选的最低分（后置过滤，默认 0 = 有框必出目标）；"
+                         "误检多时调高 0.3~0.5 抑制假阳。注意这是后置过滤，"
+                         "不再喂给 SAM3 内部 —— 内部阈值过高会把未见概念的目标删空")
+    ap.add_argument("--model-conf-threshold", type=float, default=0.0,
+                    help="SAM3 内部 confidence_threshold；默认 0 保留全部候选，"
+                         "由 select_candidate 做空间/置信过滤。一般不用改")
     ap.add_argument("--mask-threshold", type=float, default=0.5,
                     help="mask 概率二值化阈值；mask 偏小调低，偏大调高")
     ap.add_argument("--min-iou", type=float, default=0.1,
