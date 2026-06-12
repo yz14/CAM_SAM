@@ -149,9 +149,10 @@ python qa_sam3.py --mask medsam3_out/1/mask --boxes ... --output medsam3_out/1/q
 ```
 endoscope_medsam3.py
    ├── build_medsam3():  SAM3 基座 + inject LoRA + load MedSAM3 LoRA weights
-   ├── predict_text_only():  纯文本模式 —— set_text_prompt → 全实例并集
-   ├── predict_with_boxes(): 文本+框模式 —— 复用 endoscope_sam3_v2.select_candidate()
-   ├── seg_common.py:  IO/bbox/mask 后处理（三脚本共用）
+   ├── seg_concept_predict.py:  predict_text_only / predict_with_boxes
+   │      （文本 / 文本+框 推理，与 endoscope_medical_sam3.py 共用，
+   │       候选选择复用 endoscope_sam3_v2.select_candidate()）
+   ├── seg_common.py:  IO/bbox/mask 后处理（多脚本共用）
    └── lora_layers.py:  来自 MedSAM3 仓库（通过 --medsam3-repo 导入）
 ```
 
