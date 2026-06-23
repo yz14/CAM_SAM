@@ -1,9 +1,25 @@
+# ── CAM 框架 + 内镜分割管线公共依赖（pip 可直接安装） ──
 torch>=2.0
 torchvision
-grad-cam>=1.5
+grad-cam>=1.5        # 提供 pytorch_grad_cam
 pillow
 numpy
 opencv-python
 pyyaml
+tqdm                 # endoscope_sam3*.py / qa_sam3.py 进度条
 # 可选：使用 timm 模型时需要
 # timm
+
+# ── SAM3（必需，但不在 PyPI，需从源码安装） ──
+# endoscope_sam3.py / endoscope_sam3_v2.py / seg_concept_predict.py 都依赖
+#   from sam3.model_builder import build_sam3_image_model
+#   from sam3.model.sam3_image_processor import Sam3Processor
+# 安装方式（在服务器上，按官方仓库说明二选一）：
+#   1) 克隆到本项目根目录，使其作为可导入包 `sam3/`：
+#        git clone <SAM3 仓库地址> sam3
+#        pip install -e sam3
+#   2) 或直接源码安装：
+#        pip install "sam3 @ git+<SAM3 仓库地址>"
+# 安装后还需准备权重：sam3.pt 与同目录下的 bpe_simple_vocab_16e6.txt.gz
+# （路径通过 --checkpoint 传入，bpe 文件需与 sam3.pt 同级目录）。
+# 注意：SAM3 会自带 CLIP 文本编码器等子依赖，由其自身的安装脚本处理。
